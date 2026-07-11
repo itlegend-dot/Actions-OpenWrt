@@ -1,0 +1,109 @@
+name: Build FanchmWrt ZN-M2 with NSS
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "FanchmWrt 版本标签"
+        required: true
+        default: "fanchmwrt-25.12.4"
+  push:
+    branches:
+      - main
+
+env:
+  REPO_URL: https://github.com/fanchmwrt/fanchmwrt
+  REPO_BRANCH: ${{ github.event.inputs.version || 'fanchmwrt-25.12.4' }}
+  TARGET: qualcommax/ipq60xx
+  CONFIG_FILE: configs/zn-m2-nss.config
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+
+      - name: 初始化编译环境
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential ccache ecj fastjar file g++ gawk \
+            gettext git java-propose-classpath libelf-dev libncurses5-dev \
+            libncursesw5-dev libssl-dev python3 python3-distutils python3-setuptools \
+            rsync subversion swig time unzip wget xsltproc zlib1g-dev
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ env.TARGET }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.TARGET }}-
+
+      - name: 拉取 FanchmWrt 源码
+        run: |
+          git clone --depth 1 --branch $REPO_BRANCH $REPO_URL openwrt
+          cd openwrt
+          echo "源码拉取完成，版本：$REPO_BRANCH"
+
+      - name: 配置软件源（添加 NSS 源）
+        run: |
+          chmod +x scripts/*.sh
+          bash scripts/01-prepare-feeds.sh
+
+      - name: 更新软件包 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+
+      - name: 应用 NSS 内核补丁
+        run: |
+          cd openwrt
+          mkdir -p target/linux/qualcommax/patches-6.12
+          cp feeds/nss/patches/6.12/*.patch target/linux/qualcommax/patches-6.12/
+          echo "NSS 内核补丁已复制"
+
+      - name: 应用自定义设备补丁
+        run: |
+          bash scripts/02-apply-patches.sh
+
+      - name: 安装软件包 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds install -a
+
+      - name: 加载编译配置
+        run: |
+          cd openwrt
+          cp ../$CONFIG_FILE .config
+          make defconfig
+          echo "配置加载完成"
+
+      - name: 预下载源码
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: 开始编译固件
+        run: |
+          cd openwrt
+          export CCACHE_DIR=$CCACHE_DIR
+          make -j$(nproc) V=s
+          echo "编译完成，产物目录：bin/targets/$TARGET"
+
+      - name: 整理编译产物
+        run: |
+          mkdir -p output
+          cp openwrt/bin/targets/$TARGET/*.bin output/ || true
+          cp openwrt/bin/targets/$TARGET/*.img output/ || true
+          cp openwrt/bin/targets/$TARGET/sha256sums output/ || true
+
+      - name: 上传固件产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: fanchmwrt-znm2-nss-${{ env.REPO_BRANCH }}
+          path: output/
+          retention-days: 30
